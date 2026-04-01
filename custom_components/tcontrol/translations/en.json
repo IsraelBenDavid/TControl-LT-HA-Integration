@@ -1,0 +1,37 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "TControl LT16 — Connection Type",
+        "description": "Choose how the TControl LT16 controller is connected.",
+        "data": {
+          "connection_type": "Connection Type"
+        }
+      },
+      "serial": {
+        "title": "Serial Connection",
+        "description": "Configure the serial port for the TControl LT16 controller.",
+        "data": {
+          "port": "Serial Port",
+          "number_of_channels": "Number of Channels"
+        }
+      },
+      "tcp": {
+        "title": "TCP Connection",
+        "description": "Configure the TCP connection for the TControl LT16 controller.",
+        "data": {
+          "host": "Host",
+          "tcp_port": "TCP Port",
+          "number_of_channels": "Number of Channels"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the TControl LT16 controller.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This device is already configured."
+    }
+  }
+}
