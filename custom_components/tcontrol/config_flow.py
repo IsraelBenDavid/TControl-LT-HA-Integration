@@ -12,12 +12,14 @@ from homeassistant.core import HomeAssistant
 from .const import (
     CONF_CONNECTION_TYPE,
     CONF_NUM_CHANNELS,
+    CONF_SCAN_INTERVAL_MS,
     CONF_SERIAL_PORT,
     CONF_TCP_HOST,
     CONF_TCP_PORT,
     CONNECTION_TYPE_SERIAL,
     CONNECTION_TYPE_TCP,
     DEFAULT_NUM_CHANNELS,
+    DEFAULT_SCAN_INTERVAL_MS,
     DEFAULT_SERIAL_PORT,
     DEFAULT_TCP_PORT,
     DOMAIN,
@@ -72,6 +74,7 @@ class TControlConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_CONNECTION_TYPE: CONNECTION_TYPE_SERIAL,
                 CONF_SERIAL_PORT: user_input[CONF_SERIAL_PORT],
                 CONF_NUM_CHANNELS: user_input[CONF_NUM_CHANNELS],
+                CONF_SCAN_INTERVAL_MS: user_input[CONF_SCAN_INTERVAL_MS],
             }
             hub = TControlHub(data)
 
@@ -91,6 +94,9 @@ class TControlConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_NUM_CHANNELS, default=DEFAULT_NUM_CHANNELS): vol.All(
                     int, vol.Range(min=1, max=16)
                 ),
+                vol.Required(
+                    CONF_SCAN_INTERVAL_MS, default=DEFAULT_SCAN_INTERVAL_MS
+                ): vol.All(int, vol.Range(min=200)),
             }
         )
         return self.async_show_form(
@@ -109,6 +115,7 @@ class TControlConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_TCP_HOST: user_input[CONF_TCP_HOST],
                 CONF_TCP_PORT: user_input[CONF_TCP_PORT],
                 CONF_NUM_CHANNELS: user_input[CONF_NUM_CHANNELS],
+                CONF_SCAN_INTERVAL_MS: user_input[CONF_SCAN_INTERVAL_MS],
             }
             hub = TControlHub(data)
 
@@ -128,6 +135,9 @@ class TControlConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_NUM_CHANNELS, default=DEFAULT_NUM_CHANNELS): vol.All(
                     int, vol.Range(min=1, max=16)
                 ),
+                vol.Required(
+                    CONF_SCAN_INTERVAL_MS, default=DEFAULT_SCAN_INTERVAL_MS
+                ): vol.All(int, vol.Range(min=200)),
             }
         )
         return self.async_show_form(step_id="tcp", data_schema=schema, errors=errors)

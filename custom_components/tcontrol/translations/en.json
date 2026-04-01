@@ -13,7 +13,8 @@
         "description": "Configure the serial port for the TControl LT16 controller.",
         "data": {
           "port": "Serial Port",
-          "number_of_channels": "Number of Channels"
+          "number_of_channels": "Number of Channels",
+          "scan_interval_ms": "Polling Interval (ms)"
         }
       },
       "tcp": {
@@ -22,7 +23,8 @@
         "data": {
           "host": "Host",
           "tcp_port": "TCP Port",
-          "number_of_channels": "Number of Channels"
+          "number_of_channels": "Number of Channels",
+          "scan_interval_ms": "Polling Interval (ms)"
         }
       }
     },
