@@ -1,27 +1,9 @@
-"""Communication hub for the TControl LT16 controller.
-
-The controller speaks a tiny ASCII protocol over a serial line (optionally
-behind a TCP-to-serial bridge):
-
-* ``S00<HEX>ONE`` / ``S00<HEX>OFE`` switch relay ``<HEX>`` (1-9, A-F) on / off.
-* ``S00QLE`` asks for the state of every relay.  The controller answers with
-  ``A00<STATUS_BITS>E`` where ``STATUS_BITS`` is one ``0``/``1`` character per
-  channel (8 characters on an 8-channel board, 16 on a 16-channel board).
-
-Every method that touches the wire is blocking and MUST be run in an executor
-thread.  The hub opens the port, performs one exchange and closes it again;
-a lock guarantees that the periodic state poll and relay commands never open
-the port at the same time (serial-to-TCP bridges typically accept a single
-client, and interleaved serial traffic corrupts both exchanges).
-"""
+"""Communication hub for the TControl LT16 controller."""
 
 from __future__ import annotations
 
 import logging
-import re
 import socket
-import threading
-import time
 
 import serial
 
@@ -38,27 +20,12 @@ _LOGGER = logging.getLogger(__name__)
 
 # Serial settings per protocol spec
 BAUD_RATE = 9600
-SERIAL_TIMEOUT = 1.0
-
-# Upper bound for one query/response exchange, in seconds.  Protects against a
-# controller (or bridge) that keeps streaming data without ever sending a frame.
-RESPONSE_DEADLINE = 3.0
+SERIAL_TIMEOUT = 1
 
 # Protocol markers
 QUERY_COMMAND = "S00QLE"
-STATUS_FRAME = re.compile(r"A00([01]{1,16})E")
-
-
-class TControlError(Exception):
-    """Base error for hub failures."""
-
-
-class TControlConnectionError(TControlError):
-    """The controller could not be reached or the transport failed."""
-
-
-class TControlResponseError(TControlError):
-    """The controller answered with something that is not a status frame."""
+RESPONSE_PREFIX = "A00"
+RESPONSE_END = "E"
 
 
 def _channel_to_hex(channel: int) -> str:
@@ -68,21 +35,6 @@ def _channel_to_hex(channel: int) -> str:
     channel 16 maps to '10'.
     """
     return format(channel, "X")
-
-
-def parse_status_frame(raw: str) -> dict[int, bool]:
-    """Extract the relay states from a raw response buffer.
-
-    The buffer may contain noise before the frame (for example an echo of the
-    ``S00QLE`` command from the bridge), so the frame is searched rather than
-    matched from the start.  Returns a dict mapping the 1-based channel number
-    to ``True`` (on) / ``False`` (off).
-    """
-    match = STATUS_FRAME.search(raw)
-    if match is None:
-        raise TControlResponseError(f"No status frame in response {raw!r}")
-    bits = match.group(1)
-    return {channel: bit == "1" for channel, bit in enumerate(bits, start=1)}
 
 
 class TControlHub:
@@ -99,8 +51,6 @@ class TControlHub:
             self._port = ""
             self._host = config[CONF_TCP_HOST]
             self._tcp_port = int(config.get(CONF_TCP_PORT, DEFAULT_TCP_PORT))
-        # Serialises every open/exchange/close cycle across executor threads.
-        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -113,6 +63,10 @@ class TControlHub:
             return self._port
         return f"{self._host}:{self._tcp_port}"
 
+    # ------------------------------------------------------------------
+    # Command builders
+    # ------------------------------------------------------------------
+
     @staticmethod
     def build_command(channel: int, turn_on: bool) -> str:
         """Build the ASCII command string for a given channel and action."""
@@ -121,108 +75,163 @@ class TControlHub:
         return f"S00{hex_ch}{action}"
 
     # ------------------------------------------------------------------
-    # I/O — blocking, MUST be called via hass.async_add_executor_job
+    # I/O — these are blocking and MUST be called via async_add_executor_job
     # ------------------------------------------------------------------
 
     def send_command(self, channel: int, turn_on: bool) -> None:
-        """Open the connection, send a relay command and close it again.
-
-        Raises TControlConnectionError if the command could not be delivered.
-        """
+        """Open connection, send command, close connection (blocking)."""
         cmd = self.build_command(channel, turn_on)
-        with self._lock:
-            self._exchange(cmd, expect_reply=False)
+        if self._connection_type == CONNECTION_TYPE_SERIAL:
+            self._send_serial(cmd)
+        else:
+            self._send_tcp(cmd)
 
     def read_state(self) -> dict[int, bool]:
-        """Query the controller for all channel states.
+        """Query the controller for all channel states (blocking).
 
-        Returns a dict mapping the 1-based channel number to bool (True = ON).
-        Raises TControlConnectionError if the controller cannot be reached and
-        TControlResponseError if it does not answer with a status frame.
+        Returns a dict mapping 1-based channel number to bool (True = ON).
+        Returns an empty dict on communication or parse failure.
         """
-        with self._lock:
-            raw = self._exchange(QUERY_COMMAND, expect_reply=True)
-        state = parse_status_frame(raw)
-        _LOGGER.debug("State from %s: %s", self.identifier, state)
-        return state
+        try:
+            if self._connection_type == CONNECTION_TYPE_SERIAL:
+                raw = self._query_serial()
+            else:
+                raw = self._query_tcp()
+        except (OSError, serial.SerialException) as err:
+            _LOGGER.error("Failed to query state: %s", err)
+            return {}
+
+        return self._parse_response(raw)
 
     def test_connection(self) -> bool:
-        """Check that the controller is reachable and answers a state query."""
+        """Try to open and immediately close the connection (blocking).
+
+        Returns True on success, False on failure.
+        """
         try:
-            self.read_state()
-        except TControlError as err:
-            _LOGGER.debug("Connection test to %s failed: %s", self.identifier, err)
+            if self._connection_type == CONNECTION_TYPE_SERIAL:
+                with serial.Serial(self._port, BAUD_RATE, timeout=SERIAL_TIMEOUT):
+                    pass
+            else:
+                sock = socket.create_connection(
+                    (self._host, self._tcp_port), timeout=SERIAL_TIMEOUT
+                )
+                sock.close()
+        except (OSError, serial.SerialException) as err:
+            _LOGGER.debug("Connection test failed: %s", err)
             return False
         return True
 
     # ------------------------------------------------------------------
-    # Transport
+    # Query transport methods
     # ------------------------------------------------------------------
 
-    def _exchange(self, payload: str, *, expect_reply: bool) -> str:
-        """Perform one open → send → (read) → close cycle on the transport."""
-        _LOGGER.debug("TX [%s]: %s", self.identifier, payload)
-        try:
-            if self._connection_type == CONNECTION_TYPE_SERIAL:
-                reply = self._exchange_serial(payload, expect_reply)
-            else:
-                reply = self._exchange_tcp(payload, expect_reply)
-        except (OSError, serial.SerialException) as err:
-            # SerialException is an IOError subclass, listed for clarity.
-            raise TControlConnectionError(
-                f"Communication with TControl at {self.identifier} failed: {err}"
-            ) from err
-        if expect_reply:
-            _LOGGER.debug("RX [%s]: %s", self.identifier, reply)
-        return reply
-
-    def _exchange_serial(self, payload: str, expect_reply: bool) -> str:
-        """Serial transport for one exchange."""
+    def _query_serial(self) -> str:
+        """Send the query command over serial and return the raw response."""
+        _LOGGER.debug("Serial TX [%s]: %s", self._port, QUERY_COMMAND)
         with serial.Serial(self._port, BAUD_RATE, timeout=SERIAL_TIMEOUT) as ser:
-            # Drop anything the controller sent while the port was closed so an
-            # old frame is never mistaken for the answer to this query.
-            ser.reset_input_buffer()
-            ser.write(payload.encode("ascii"))
-            # Make sure the bytes really left the port before we close it.
-            ser.flush()
-            if not expect_reply:
-                return ""
-            return self._read_frame(lambda: ser.read(max(1, ser.in_waiting)))
+            ser.write(QUERY_COMMAND.encode("ascii"))
+            response = self._read_until_end_serial(ser)
+        _LOGGER.debug("Serial RX [%s]: %s", self._port, response)
+        return response
 
-    def _exchange_tcp(self, payload: str, expect_reply: bool) -> str:
-        """TCP (serial bridge) transport for one exchange."""
+    def _query_tcp(self) -> str:
+        """Send the query command over TCP and return the raw response."""
+        _LOGGER.debug("TCP TX [%s:%s]: %s", self._host, self._tcp_port, QUERY_COMMAND)
         with socket.create_connection(
             (self._host, self._tcp_port), timeout=SERIAL_TIMEOUT
         ) as sock:
-            sock.sendall(payload.encode("ascii"))
-            if not expect_reply:
-                return ""
-            sock.settimeout(SERIAL_TIMEOUT)
+            sock.sendall(QUERY_COMMAND.encode("ascii"))
+            response = self._read_until_end_tcp(sock)
+        _LOGGER.debug("TCP RX [%s:%s]: %s", self._host, self._tcp_port, response)
+        return response
 
-            def _recv() -> bytes:
-                try:
-                    return sock.recv(64)
-                except TimeoutError:
-                    return b""
-
-            return self._read_frame(_recv)
+    # ------------------------------------------------------------------
+    # Response reading helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _read_frame(read_chunk) -> str:
-        """Accumulate data until a complete A00...E frame is seen or we time out.
-
-        ``read_chunk`` returns b"" when the transport timed out.  Reading stops
-        at the first complete frame rather than at the first "E" so an echoed
-        command (``S00QLE`` also ends with an E) cannot truncate the answer.
-        """
-        deadline = time.monotonic() + RESPONSE_DEADLINE
+    def _read_until_end_serial(ser: serial.Serial) -> str:
+        """Read from serial port until 'E' terminator or timeout."""
         buf = b""
-        while time.monotonic() < deadline:
-            chunk = read_chunk()
+        while True:
+            chunk = ser.read(1)
+            if not chunk:
+                # Timeout — return whatever we have
+                break
+            buf += chunk
+            if chunk == b"E":
+                break
+        return buf.decode("ascii", errors="replace")
+
+    @staticmethod
+    def _read_until_end_tcp(sock: socket.socket) -> str:
+        """Read from TCP socket until 'E' terminator or timeout."""
+        sock.settimeout(SERIAL_TIMEOUT)
+        buf = b""
+        while True:
+            try:
+                chunk = sock.recv(1)
+            except socket.timeout:
+                break
             if not chunk:
                 break
             buf += chunk
-            text = buf.decode("ascii", errors="replace")
-            if STATUS_FRAME.search(text):
-                return text
+            if chunk == b"E":
+                break
         return buf.decode("ascii", errors="replace")
+
+    # ------------------------------------------------------------------
+    # Response parser
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_response(raw: str) -> dict[int, bool]:
+        """Parse a response like 'A0011111100E' into {channel: bool}.
+
+        Expected format: A00[STATUS_BITS]E
+        STATUS_BITS length is dynamic (8 or 16 depending on hardware).
+        """
+        raw = raw.strip()
+        if not raw.startswith(RESPONSE_PREFIX) or not raw.endswith(RESPONSE_END):
+            _LOGGER.warning("Invalid response format: %r", raw)
+            return {}
+
+        status_bits = raw[len(RESPONSE_PREFIX) : -len(RESPONSE_END)]
+
+        if not status_bits or not all(c in ("0", "1") for c in status_bits):
+            _LOGGER.warning("Invalid status bits in response: %r", status_bits)
+            return {}
+
+        return {
+            channel: bit == "1"
+            for channel, bit in enumerate(status_bits, start=1)
+        }
+
+    # ------------------------------------------------------------------
+    # Private send-only transport methods
+    # ------------------------------------------------------------------
+
+    def _send_serial(self, cmd: str) -> None:
+        """Send *cmd* over a serial port (blocking)."""
+        _LOGGER.debug("Serial TX [%s]: %s", self._port, cmd)
+        try:
+            with serial.Serial(self._port, BAUD_RATE, timeout=SERIAL_TIMEOUT) as ser:
+                ser.write(cmd.encode("ascii"))
+        except serial.SerialException as err:
+            _LOGGER.error("Serial send failed on %s: %s", self._port, err)
+            raise
+
+    def _send_tcp(self, cmd: str) -> None:
+        """Send *cmd* over a TCP socket (blocking)."""
+        _LOGGER.debug("TCP TX [%s:%s]: %s", self._host, self._tcp_port, cmd)
+        try:
+            with socket.create_connection(
+                (self._host, self._tcp_port), timeout=SERIAL_TIMEOUT
+            ) as sock:
+                sock.sendall(cmd.encode("ascii"))
+        except OSError as err:
+            _LOGGER.error(
+                "TCP send failed to %s:%s: %s", self._host, self._tcp_port, err
+            )
+            raise
