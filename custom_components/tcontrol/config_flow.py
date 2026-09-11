@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 import voluptuous as vol
-
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.core import HomeAssistant
 
@@ -53,7 +52,9 @@ class TControlConfigFlow(ConfigFlow, domain=DOMAIN):
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_CONNECTION_TYPE, default=CONNECTION_TYPE_SERIAL): vol.In(
+                vol.Required(
+                    CONF_CONNECTION_TYPE, default=CONNECTION_TYPE_SERIAL
+                ): vol.In(
                     {
                         CONNECTION_TYPE_SERIAL: "Serial",
                         CONNECTION_TYPE_TCP: "TCP",
@@ -99,9 +100,7 @@ class TControlConfigFlow(ConfigFlow, domain=DOMAIN):
                 ): vol.All(int, vol.Range(min=200)),
             }
         )
-        return self.async_show_form(
-            step_id="serial", data_schema=schema, errors=errors
-        )
+        return self.async_show_form(step_id="serial", data_schema=schema, errors=errors)
 
     async def async_step_tcp(
         self, user_input: dict[str, Any] | None = None
